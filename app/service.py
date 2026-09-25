@@ -2,29 +2,66 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
 from typing import Any
 
 from app.database import connection, now, transaction
-from app.security import expiry, issue_token, password_hash, request_hash, sanitize, stable_json, token_hash, verify_password
+from app.security import audit_chain_hash, expiry, issue_token, password_hash, request_hash, sanitize, stable_json, token_hash, verify_password
 
 
 class ServiceError(Exception):
-    def __init__(self, code: str, message: str, status: int = 400):
-        self.code, self.message, self.status = code, message, status
+    def __init__(self, code: str, message: str, status: int = 400, details: dict[str, Any] | None = None):
+        self.code, self.message, self.status, self.details = code, message, status, details or {}
         super().__init__(message)
 
 
-class ResearchService:
+class BaseService:
+    """共享仓储基类：审计哈希链与项目角色检查。所有写方法须在即时事务内调用。"""
+
     def __init__(self, db: sqlite3.Connection | None = None):
         self.db = db or connection()
 
     def audit(self, action: str, resource_type: str, resource_id: str, payload: dict[str, Any], *, project_id: int | None = None, actor_id: int | None = None) -> None:
+        stamp = now()
+        body = stable_json(sanitize(payload))
+        previous_row = self.db.execute("SELECT hash FROM audit_events ORDER BY id DESC LIMIT 1").fetchone()
+        previous = previous_row["hash"] if previous_row else ""
+        event = {"project_id": project_id, "actor_id": actor_id, "action": action, "resource_type": resource_type, "resource_id": resource_id, "payload_json": body, "created_at": stamp}
+        digest = audit_chain_hash(previous, event)
         self.db.execute(
-            "INSERT INTO audit_events(project_id,actor_id,action,resource_type,resource_id,payload_json,created_at) VALUES(?,?,?,?,?,?,?)",
-            (project_id, actor_id, action, resource_type, resource_id, stable_json(sanitize(payload)), now()),
+            "INSERT INTO audit_events(project_id,actor_id,action,resource_type,resource_id,payload_json,prev_hash,hash,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (project_id, actor_id, action, resource_type, resource_id, body, previous, digest, stamp),
         )
 
+    def require_role(self, project_id: int, user_id: int, allowed: set[str]) -> str:
+        row = self.db.execute("SELECT role FROM project_members WHERE project_id=? AND user_id=?", (project_id, user_id)).fetchone()
+        if row is None or row["role"] not in allowed:
+            raise ServiceError("forbidden", "当前用户没有执行该操作的项目权限", 403)
+        return row["role"]
+
+    def member_role(self, project_id: int, user_id: int) -> str | None:
+        row = self.db.execute("SELECT role FROM project_members WHERE project_id=? AND user_id=?", (project_id, user_id)).fetchone()
+        return row["role"] if row else None
+
+    def verify_audit_chain(self, project_id: int | None = None) -> dict[str, Any]:
+        query = "SELECT * FROM audit_events"
+        params: tuple[Any, ...] = ()
+        if project_id is not None:
+            query += " WHERE project_id=?"
+            params = (project_id,)
+        rows = self.db.execute(query + " ORDER BY id", params).fetchall()
+        previous = ""
+        checked = 0
+        for row in rows:
+            if row["prev_hash"] != previous:
+                return {"valid": False, "checked": checked, "first_bad_id": row["id"], "reason": "prev_hash 不连续"}
+            if audit_chain_hash(previous, dict(row)) != row["hash"]:
+                return {"valid": False, "checked": checked, "first_bad_id": row["id"], "reason": "事件哈希不匹配"}
+            previous = row["hash"]
+            checked += 1
+        return {"valid": True, "checked": checked, "head": previous}
+
+
+class ResearchService(BaseService):
     def create_user(self, payload: dict[str, Any]) -> dict[str, Any]:
         stamp = now()
         try:
@@ -72,12 +109,6 @@ class ResearchService:
         except sqlite3.IntegrityError as exc:
             raise ServiceError("project_exists", "项目编码已存在", 409) from exc
 
-    def require_role(self, project_id: int, user_id: int, allowed: set[str]) -> str:
-        row = self.db.execute("SELECT role FROM project_members WHERE project_id=? AND user_id=?", (project_id, user_id)).fetchone()
-        if row is None or row["role"] not in allowed:
-            raise ServiceError("forbidden", "当前用户没有执行该操作的项目权限", 403)
-        return row["role"]
-
     def add_member(self, project_id: int, actor_id: int, user_id: int, role: str) -> dict[str, Any]:
         self.require_role(project_id, actor_id, {"owner"})
         stamp = now()
@@ -109,7 +140,7 @@ class ResearchService:
 
     def finish(self, job_id: int, worker_id: str, result: dict[str, Any]) -> dict[str, Any]:
         with transaction(immediate=True) as db:
-            row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             if row is None or row["status"] != "leased" or row["lease_owner"] != worker_id:
                 raise ServiceError("job_not_owned", "任务不存在或不属于该工作者", 409)
             db.execute("UPDATE jobs SET status='done',result_json=?,lease_owner='',lease_until='',updated_at=? WHERE id=?", (stable_json(result), now(), job_id))

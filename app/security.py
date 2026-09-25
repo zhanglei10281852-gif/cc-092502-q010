@@ -53,3 +53,17 @@ def stable_json(value: Any) -> str:
 
 def request_hash(value: Any) -> str:
     return hashlib.sha256(stable_json(value).encode()).hexdigest()
+
+
+def content_hash(value: Any) -> str:
+    """任意可 JSON 序列化内容的规范化哈希，用于资源版本与发布包。"""
+    return hashlib.sha256(stable_json(value).encode()).hexdigest()
+
+
+AUDIT_CHAIN_FIELDS = ("project_id", "actor_id", "action", "resource_type", "resource_id", "payload_json", "created_at")
+
+
+def audit_chain_hash(prev_hash: str, event: dict[str, Any]) -> str:
+    """审计事件哈希链：每条事件链接前一条，篡改任一历史事件都会被校验发现。"""
+    material = {field: event.get(field) for field in AUDIT_CHAIN_FIELDS}
+    return hashlib.sha256((prev_hash + "|" + stable_json(material)).encode()).hexdigest()
