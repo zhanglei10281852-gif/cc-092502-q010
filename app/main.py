@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
+from app.argumentation.router import router as argumentation_router
 from app.database import close_connection, connection, init_db
 from app.schemas import JobCreate, JobFinish, LoginRequest, MemberCreate, ProjectCreate, UserCreate
 from app.service import ResearchService, ServiceError
@@ -18,13 +19,17 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="考古研究协作基础服务", version="1.0.0", lifespan=lifespan)
+app.include_router(argumentation_router)
 
 
 @app.exception_handler(ServiceError)
 async def handle_service_error(request, exc: ServiceError):
     del request
     from fastapi.responses import JSONResponse
-    return JSONResponse(status_code=exc.status, content={"error": {"code": exc.code, "message": exc.message}})
+    content = {"error": {"code": exc.code, "message": exc.message}}
+    if exc.details:
+        content["error"]["details"] = exc.details
+    return JSONResponse(status_code=exc.status, content=content)
 
 
 def current_user(authorization: str = Header(...)):

@@ -6,12 +6,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.database import connection, now, transaction
-from app.security import expiry, issue_token, password_hash, request_hash, sanitize, stable_json, token_hash, verify_password
+from app.security import audit_event_hash, expiry, issue_token, password_hash, request_hash, sanitize, stable_json, token_hash, verify_password
 
 
 class ServiceError(Exception):
-    def __init__(self, code: str, message: str, status: int = 400):
-        self.code, self.message, self.status = code, message, status
+    def __init__(self, code: str, message: str, status: int = 400, details: dict[str, Any] | None = None):
+        self.code, self.message, self.status, self.details = code, message, status, details or {}
         super().__init__(message)
 
 
@@ -20,9 +20,14 @@ class ResearchService:
         self.db = db or connection()
 
     def audit(self, action: str, resource_type: str, resource_id: str, payload: dict[str, Any], *, project_id: int | None = None, actor_id: int | None = None) -> None:
+        stamp = now()
+        body = stable_json(sanitize(payload))
+        last = self.db.execute("SELECT event_hash FROM audit_events ORDER BY id DESC LIMIT 1").fetchone()
+        prev = last["event_hash"] if last else ""
+        fields = {"project_id": project_id, "actor_id": actor_id, "action": action, "resource_type": resource_type, "resource_id": resource_id, "payload_json": body, "prev_hash": prev, "created_at": stamp}
         self.db.execute(
-            "INSERT INTO audit_events(project_id,actor_id,action,resource_type,resource_id,payload_json,created_at) VALUES(?,?,?,?,?,?,?)",
-            (project_id, actor_id, action, resource_type, resource_id, stable_json(sanitize(payload)), now()),
+            "INSERT INTO audit_events(project_id,actor_id,action,resource_type,resource_id,payload_json,prev_hash,event_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (project_id, actor_id, action, resource_type, resource_id, body, prev, audit_event_hash(prev, fields), stamp),
         )
 
     def create_user(self, payload: dict[str, Any]) -> dict[str, Any]:

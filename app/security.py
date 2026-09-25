@@ -53,3 +53,8 @@ def stable_json(value: Any) -> str:
 
 def request_hash(value: Any) -> str:
     return hashlib.sha256(stable_json(value).encode()).hexdigest()
+
+
+def audit_event_hash(prev_hash: str, fields: dict[str, Any]) -> str:
+    """审计事件哈希链：把上一条事件哈希与当前事件核心字段绑定，供离线校验。"""
+    return hashlib.sha256((prev_hash + "|" + stable_json(fields)).encode()).hexdigest()
